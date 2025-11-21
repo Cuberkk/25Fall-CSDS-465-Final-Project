@@ -20,6 +20,7 @@ data/test_split.csv
 data/train.csv
 *.zip
 *.pth
+.vscode
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
