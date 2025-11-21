@@ -35,7 +35,7 @@ IM_SIZE = 299
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-DATA_ROOT = "./plant-pathology-2021-fgvc8"
+DATA_ROOT = "/data"
 TRAIN_DIR = os.path.join(DATA_ROOT, "train_images")
 TEST_DIR = os.path.join(DATA_ROOT, "test_images")
 TRAIN_DATA_FILE = os.path.join(DATA_ROOT, "train.csv")
@@ -53,11 +53,6 @@ CLASSES = [
     "scab",
     "frog_eye_leaf_spot",
 ]
-
-
-# =============================
-# 读取 & 处理标签
-# =============================
 
 def read_image_labels() -> pd.DataFrame:
     df = pd.read_csv(TRAIN_DATA_FILE).set_index("image")
@@ -150,7 +145,11 @@ class PlantDataset(Dataset):
 
 train_transform = A.Compose(
     [
-        A.RandomResizedCrop(height=IM_SIZE, width=IM_SIZE),
+        A.RandomResizedCrop(
+            size=IM_SIZE, 
+            scale=(0.08, 1.0),
+            ratio=(0.75, 1.3333333),
+        ),
         A.HorizontalFlip(p=0.5),
         A.ShiftScaleRotate(p=0.5),
         A.RandomBrightnessContrast(p=0.5),
@@ -168,14 +167,9 @@ val_transform = A.Compose(
 )
 
 
-# =============================
-# 模型定义 & 加载
-# =============================
-
 def build_model() -> nn.Module:
     model = torchvision.models.inception_v3(pretrained=True)
     model.aux_logits = False
-    # 注意：这里是 Linear(2048 -> 6) + Sigmoid，和你原来 inference 代码一致
     model.fc = nn.Sequential(
         nn.Linear(2048, 6),
         nn.Sigmoid(),

@@ -32,13 +32,18 @@ IM_SIZE = 299
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # 根目录：
-DATA_ROOT = "./plant-pathology-2021-fgvc8"
+DATA_ROOT = "./data"
 TRAIN_DIR = os.path.join(DATA_ROOT, "train_images")
-TEST_DIR = os.path.join(DATA_ROOT, "test_images")
-TRAIN_DATA_FILE = os.path.join(DATA_ROOT, "train.csv")
+TEST_DIR = os.path.join(DATA_ROOT, "manual_test_images")
+TRAIN_DATA_FILE = os.path.join(DATA_ROOT, "train_split.csv")
+TEST_DATA_FILE = os.path.join(DATA_ROOT, "test_split.csv")
+LOG_FILE = os.path.join(DATA_ROOT, "train_log.txt")
 
 BESTMODEL_DIR = os.path.join(DATA_ROOT, "inception_v3_bestmodel")
 
+if os.path.exists(LOG_FILE):
+    os.remove(LOG_FILE)
+    print(f"Previous log file removed: {LOG_FILE}")
 
 # =============================
 # 读取 & 处理标签
@@ -82,9 +87,11 @@ def get_one_hot_encoded_labels(dataset_df: pd.DataFrame) -> pd.DataFrame:
 # =============================
 
 train_df = read_image_labels(TRAIN_DATA_FILE).sample(frac=1.0, random_state=42)
-print(f"Total training samples: {len(train_df)}")
+test_df = read_image_labels(TEST_DATA_FILE)
+print(f"Total training samples: {len(train_df)}, Total test samples: {len(test_df)}")
 
 tr_df = get_one_hot_encoded_labels(train_df)
+test_df = get_one_hot_encoded_labels(test_df)
 
 # 6 个基础类别（多标签输出维度）
 CLASSES = [
@@ -105,6 +112,11 @@ X_train, X_valid, Y_train, Y_valid = train_test_split(
     np.array(tr_df[CLASSES]),
     test_size=0.2,
     random_state=42,
+)
+
+X_test, Y_test = (
+    pd.Series(test_df.index),
+    np.array(test_df[CLASSES]),
 )
 
 print(f"Train size: {len(X_train)}, Valid size: {len(X_valid)}")
@@ -169,7 +181,7 @@ class PlantDataset(Dataset):
 
 train_transform = A.Compose(
     [
-        A.RandomResizedCrop(height=IM_SIZE, width=IM_SIZE),
+        A.RandomResizedCrop(size=(IM_SIZE, IM_SIZE)),
         A.HorizontalFlip(p=0.5),
         A.ShiftScaleRotate(p=0.5),
         A.RandomBrightnessContrast(p=0.5),
@@ -192,9 +204,11 @@ val_transform = A.Compose(
 
 trainset = PlantDataset(X_train, Y_train, transform=train_transform, kind="train")
 validset = PlantDataset(X_valid, Y_valid, transform=val_transform, kind="val")
+testset = PlantDataset(X_test, Y_test, transform=val_transform, kind="test")
 
 trainloader = DataLoader(trainset, batch_size=BATCH, shuffle=True, num_workers=4)
 validloader = DataLoader(validset, batch_size=BATCH, shuffle=False, num_workers=4)
+testloader = DataLoader(testset, batch_size=BATCH, shuffle=False, num_workers=4)
 
 
 # =============================
@@ -237,7 +251,7 @@ monitor = MetricMonitor()
 
 
 # =============================
-# 训练主循环
+# Main Train
 # =============================
 
 def train(num_epochs: int = 20, threshold: float = 0.4):
@@ -257,7 +271,7 @@ def train(num_epochs: int = 20, threshold: float = 0.4):
 
         train_metric = BinaryF1Score(threshold=threshold).to(DEVICE)
 
-        for images, labels in trainloader:
+        for i, (images, labels) in enumerate(trainloader):
             images = images.to(DEVICE)
             labels = labels.to(DEVICE)
 
@@ -266,7 +280,8 @@ def train(num_epochs: int = 20, threshold: float = 0.4):
             loss = criterion(preds.float(), labels.float())
             loss.backward()
             optimizer.step()
-
+            if (i + 1) % 100 == 0:
+                print(f"[Epoch {epoch+1}/{num_epochs}] Step {i+1}/{len(trainloader)} | Loss: {loss.item():.4f}")
             train_loss += loss.detach().item()
             train_f1 += train_metric(preds, labels).item()
             train_batches += 1
@@ -280,7 +295,12 @@ def train(num_epochs: int = 20, threshold: float = 0.4):
         valid_f1 = 0.0
         valid_batches = 0
 
+        test_loss = 0.0
+        test_f1 = 0.0
+        test_batches = 0
+
         valid_metric = BinaryF1Score(threshold=threshold).to(DEVICE)
+        test_metric = BinaryF1Score(threshold=threshold).to(DEVICE)
 
         with torch.no_grad():
             for images, labels in validloader:
@@ -294,14 +314,33 @@ def train(num_epochs: int = 20, threshold: float = 0.4):
                 valid_f1 += valid_metric(preds, labels).item()
                 valid_batches += 1
 
+            for images, labels in testloader:
+                images = images.to(DEVICE)
+                labels = labels.to(DEVICE)
+
+                preds = model(images.float())
+                loss = criterion(preds.float(), labels.float())
+                test_loss += loss.detach().item()
+                test_f1 += test_metric(preds, labels).item()
+                test_batches += 1
+            
         avg_valid_loss = valid_loss / max(valid_batches, 1)
         avg_valid_f1 = valid_f1 / max(valid_batches, 1)
 
-        print(
+        avg_test_loss = test_loss / max(test_batches, 1)
+        avg_test_f1 = test_f1 / max(test_batches, 1)
+
+        log_line = (
             f"Epoch [{epoch+1}/{num_epochs}] "
             f"| Train Loss: {avg_train_loss:.4f}, Train F1: {avg_train_f1:.4f} "
-            f"| Valid Loss: {avg_valid_loss:.4f}, Valid F1: {avg_valid_f1:.4f}"
+            f"| Valid Loss: {avg_valid_loss:.4f}, Valid F1: {avg_valid_f1:.4f} "
+            f"| Test Loss: {avg_test_loss:.4f}, Test F1: {avg_test_f1:.4f}"
         )
+
+        print(log_line)
+
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_line + "\n")
 
         monitor.update("loss", avg_valid_loss)
         monitor.update("f1", avg_valid_f1)
@@ -322,7 +361,7 @@ def train(num_epochs: int = 20, threshold: float = 0.4):
             torch.save(checkpoint, best_path)
             print(f"  -> New best model saved to: {best_path}")
 
-        # ---------- Optional: 每 N 个 epoch 额外存一份 ----------
+        # ---------- Save one model every 20 epochs ----------
         if (epoch + 1) % 20 == 0:
             epoch_path = os.path.join(
                 BESTMODEL_DIR,
@@ -333,4 +372,4 @@ def train(num_epochs: int = 20, threshold: float = 0.4):
 
 
 if __name__ == "__main__":
-    train(num_epochs=20, threshold=0.4)
+    train(num_epochs=40, threshold=0.4)
