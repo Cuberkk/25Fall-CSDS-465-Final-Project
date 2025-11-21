@@ -3,6 +3,17 @@ data/train_images/
 data/manual_test_images/
 data/test_images/
 data/inception_v3_bestmodel/
+data/healthy/
+data/complex/
+data/frog_eye_leaf_spot/
+data/rust/
+data/scab/
+data/powdery_mildew/
+data/healthy2complex/
+data/healthy2frog_eye_leaf_spot/
+data/healthy2rust/
+data/healthy2scab/
+data/healthy2powdery_mildew/
 data/sample_submission.csv
 data/train_split.csv
 data/test_split.csv
