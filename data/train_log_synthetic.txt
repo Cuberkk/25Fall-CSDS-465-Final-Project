@@ -1,0 +1,2 @@
+Total training samples: 20924 
+ Train size: 17570, Valid size: 3354, Test size: 1864

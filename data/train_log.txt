@@ -1,5 +1,5 @@
-Total training samples: 16768, Total test samples: 1864
-Train size: 13414, Valid size: 3354
+Total training samples: 16768, 
+Train size: 13414, Valid size: 3354, Total test samples: 1864
 Epoch [1/40] | Train Loss: 0.2371, Train F1: 0.6990 | Valid Loss: 0.1288, Valid F1: 0.8634 | Test Loss: 0.1312, Test F1: 0.8588
 Epoch [2/40] | Train Loss: 0.1813, Train F1: 0.7970 | Valid Loss: 0.1270, Valid F1: 0.8580 | Test Loss: 0.1371, Test F1: 0.8500
 Epoch [3/40] | Train Loss: 0.1666, Train F1: 0.8145 | Valid Loss: 0.1108, Valid F1: 0.8748 | Test Loss: 0.1134, Test F1: 0.8744

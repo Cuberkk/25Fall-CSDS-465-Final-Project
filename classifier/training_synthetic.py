@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+from typing import List
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torchvision
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+
+from sklearn.model_selection import train_test_split
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from torchmetrics.classification import BinaryF1Score
+
+
+# =============================
+# Hyper-parameters & paths
+# =============================
+
+BATCH = 16
+LR = 1e-4
+IM_SIZE = 299
+
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# 根目录：
+DATA_ROOT = "/home/erie_lab/Documents/kxz365/ECSE465/25Fall-CSDS-465-Final-Project/data"
+TRAIN_DIR = os.path.join(DATA_ROOT, "train_images")
+TEST_DIR = os.path.join(DATA_ROOT, "manual_test_images")
+SYNTHETIC_DIR = os.path.join(DATA_ROOT, "generated_complex")
+TRAIN_DATA_FILE = os.path.join(DATA_ROOT, "train_split.csv")
+SYNTHETIC_DATA_FILE = os.path.join(DATA_ROOT, "generated_complex.csv")
+TEST_DATA_FILE = os.path.join(DATA_ROOT, "test_split.csv")
+LOG_FILE = os.path.join(DATA_ROOT, "train_log_synthetic.txt")
+
+BESTMODEL_DIR = os.path.join(DATA_ROOT, "inception_v3_bestmodel_synthetic")
+
+if os.path.exists(LOG_FILE):
+    os.remove(LOG_FILE)
+    print(f"Previous log file removed: {LOG_FILE}")
+
+# =============================
+# 读取 & 处理标签
+# =============================
+
+def read_image_labels(csv_path: str) -> pd.DataFrame:
+    """Read train.csv and index by image name."""
+    df = pd.read_csv(csv_path).set_index("image")
+    return df
+
+
+def get_single_labels(unique_labels) -> List[str]:
+    """Split multi-label strings and return list of unique classes."""
+    single_labels = []
+    for label in unique_labels:
+        single_labels += label.split()
+    single_labels = set(single_labels)
+    return list(single_labels)
+
+
+CLASSES = [
+    "rust",
+    "complex",
+    "healthy",
+    "powdery_mildew",
+    "scab",
+    "frog_eye_leaf_spot",
+]
+
+def get_one_hot_encoded_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert 'labels' col into fixed-length 6-dim multi-hot vectors."""
+    df = df.copy()
+
+    # 初始化所有列为 0
+    for cls in CLASSES:
+        df[cls] = 0
+
+    # multi-hot
+    for idx, label_str in df["labels"].items():
+        labels = label_str.split()  # 支持 "rust complex" 这种
+        for lb in labels:
+            if lb in CLASSES:
+                df.at[idx, lb] = 1   # 设置对应位置为 1
+
+    return df
+
+# =============================
+# 读取数据 & one-hot
+# =============================
+
+train_df = read_image_labels(TRAIN_DATA_FILE).sample(frac=1.0, random_state=42)
+synthetic_df = read_image_labels(SYNTHETIC_DATA_FILE).sample(frac=1.0, random_state=42)
+test_df = read_image_labels(TEST_DATA_FILE)
+print(f"Total training samples: {len(train_df)}, Total test samples: {len(test_df)}")
+
+tr_df = get_one_hot_encoded_labels(train_df)
+test_df = get_one_hot_encoded_labels(test_df)
+synthetic_df = get_one_hot_encoded_labels(synthetic_df)
+
+# 6 个基础类别（多标签输出维度）
+
+
+# =============================
+# Train / Val 划分
+# =============================
+
+X_train, X_valid, Y_train, Y_valid = train_test_split(
+    pd.Series(train_df.index),
+    np.array(tr_df[CLASSES]),
+    test_size=0.2,
+    random_state=42,
+)
+
+X_synthetic, Y_synthetic = (
+    pd.Series(synthetic_df.index),
+    np.array(synthetic_df[CLASSES]),
+)
+
+X_test, Y_test = (
+    pd.Series(test_df.index),
+    np.array(test_df[CLASSES]),
+)
+
+init_log = f"Total training samples: {len(X_train) + len(X_synthetic)+ len(X_valid)} \n Train size: {len(X_train) + len(X_synthetic)}, Valid size: {len(X_valid)}, Test size: {len(X_test)}"
+print(init_log)
+with open(LOG_FILE, "w", encoding="utf-8") as f:
+    f.write(init_log + "\n")
+
+# =============================
+# 图像加载 & Dataset
+# =============================
+
+folders = dict(
+    {
+        "data": DATA_ROOT,
+        "train": TRAIN_DIR,
+        "val": TRAIN_DIR,   # 验证集使用同一目录，只是索引不同
+        "synthetic": SYNTHETIC_DIR,
+        "test": TEST_DIR,
+    }
+)
+
+
+def get_image(image_id, kind: str = "train") -> Image.Image:
+    """Load an image from file."""
+    fname = os.path.join(folders[kind], image_id)
+    return Image.open(fname)
+
+
+class PlantDataset(Dataset):
+    def __init__(
+        self,
+        image_ids: pd.Series,
+        targets: np.ndarray,
+        transform=None,
+        target_transform=None,
+        kind: str = "train",
+    ):
+        self.image_ids = image_ids.reset_index(drop=True)
+        self.targets = targets
+        self.transform = transform
+        self.target_transform = target_transform
+        self.kind = kind
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        # load and transform image
+        img = np.array(get_image(self.image_ids.iloc[idx], kind=self.kind))
+
+        if self.transform:
+            img = self.transform(image=img)["image"]
+
+        # target
+        target = self.targets[idx]
+        if self.target_transform:
+            target = self.target_transform(target)
+
+        return img, target
+
+
+# =============================
+# Albumentations transforms
+# =============================
+
+train_transform = A.Compose(
+    [
+        A.RandomResizedCrop(size=(IM_SIZE, IM_SIZE)),
+        A.HorizontalFlip(p=0.5),
+        A.ShiftScaleRotate(p=0.5),
+        A.RandomBrightnessContrast(p=0.5),
+        A.Normalize(),
+        ToTensorV2(),
+    ]
+)
+
+val_transform = A.Compose(
+    [
+        A.Resize(height=IM_SIZE, width=IM_SIZE),
+        A.Normalize(),
+        ToTensorV2(),
+    ]
+)
+
+# =============================
+# Dataloaders
+# =============================
+
+trainset = PlantDataset(X_train, Y_train, transform=train_transform, kind="train")
+syntheticset = PlantDataset(X_synthetic, Y_synthetic, transform=train_transform, kind="synthetic")
+combined_trainset = ConcatDataset([trainset, syntheticset])
+validset = PlantDataset(X_valid, Y_valid, transform=val_transform, kind="val")
+testset = PlantDataset(X_test, Y_test, transform=val_transform, kind="test")
+
+trainloader = DataLoader(combined_trainset, batch_size=BATCH, shuffle=True, num_workers=4)
+validloader = DataLoader(validset, batch_size=BATCH, shuffle=False, num_workers=4)
+testloader = DataLoader(testset, batch_size=BATCH, shuffle=False, num_workers=4)
+
+
+# =============================
+# 模型定义：Inception v3 多标签
+# =============================
+
+model = torchvision.models.inception_v3(pretrained=True)
+model.aux_logits = False
+model.fc = nn.Sequential(
+    nn.Linear(2048, 2048),
+    nn.ReLU(inplace=True),
+    nn.Dropout(0.5),
+    nn.Linear(2048, len(CLASSES)),
+    nn.Sigmoid(),
+)
+model = model.to(DEVICE)
+
+criterion = nn.BCELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+
+# =============================
+# 训练监控工具
+# =============================
+
+class MetricMonitor:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.losses = []
+        self.scores = []
+        self.metrics = dict({"loss": self.losses, "f1": self.scores})
+
+    def update(self, metric_name, value):
+        self.metrics[metric_name].append(value)
+
+
+monitor = MetricMonitor()
+
+
+# =============================
+# Main Train
+# =============================
+
+def train(num_epochs: int = 20, threshold: float = 0.4):
+    os.makedirs(BESTMODEL_DIR, exist_ok=True)
+
+    best_f1 = 0.0
+
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA version: {torch.version.cuda}")
+
+    for epoch in range(num_epochs):
+        # ---------- Train ----------
+        model.train()
+        train_loss = 0.0
+        train_f1 = 0.0
+        train_batches = 0
+
+        train_metric = BinaryF1Score(threshold=threshold).to(DEVICE)
+
+        for i, (images, labels) in enumerate(trainloader):
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            optimizer.zero_grad()
+            preds = model(images.float())
+            loss = criterion(preds.float(), labels.float())
+            loss.backward()
+            optimizer.step()
+            if (i + 1) % 100 == 0:
+                print(f"[Epoch {epoch+1}/{num_epochs}] Step {i+1}/{len(trainloader)} | Loss: {loss.item():.4f}")
+            train_loss += loss.detach().item()
+            train_f1 += train_metric(preds, labels).item()
+            train_batches += 1
+
+        avg_train_loss = train_loss / max(train_batches, 1)
+        avg_train_f1 = train_f1 / max(train_batches, 1)
+
+        # ---------- Valid ----------
+        model.eval()
+        valid_loss = 0.0
+        valid_f1 = 0.0
+        valid_batches = 0
+
+        test_loss = 0.0
+        test_f1 = 0.0
+        test_batches = 0
+
+        valid_metric = BinaryF1Score(threshold=threshold).to(DEVICE)
+        test_metric = BinaryF1Score(threshold=threshold).to(DEVICE)
+
+        with torch.no_grad():
+            for images, labels in validloader:
+                images = images.to(DEVICE)
+                labels = labels.to(DEVICE)
+
+                preds = model(images.float())
+                loss = criterion(preds.float(), labels.float())
+
+                valid_loss += loss.detach().item()
+                valid_f1 += valid_metric(preds, labels).item()
+                valid_batches += 1
+
+            for images, labels in testloader:
+                images = images.to(DEVICE)
+                labels = labels.to(DEVICE)
+
+                preds = model(images.float())
+                loss = criterion(preds.float(), labels.float())
+                test_loss += loss.detach().item()
+                test_f1 += test_metric(preds, labels).item()
+                test_batches += 1
+            
+        avg_valid_loss = valid_loss / max(valid_batches, 1)
+        avg_valid_f1 = valid_f1 / max(valid_batches, 1)
+
+        avg_test_loss = test_loss / max(test_batches, 1)
+        avg_test_f1 = test_f1 / max(test_batches, 1)
+
+        log_line = (
+            f"Epoch [{epoch+1}/{num_epochs}] "
+            f"| Train Loss: {avg_train_loss:.4f}, Train F1: {avg_train_f1:.4f} "
+            f"| Valid Loss: {avg_valid_loss:.4f}, Valid F1: {avg_valid_f1:.4f} "
+            f"| Test Loss: {avg_test_loss:.4f}, Test F1: {avg_test_f1:.4f}"
+        )
+
+        print(log_line)
+
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_line + "\n")
+
+        monitor.update("loss", avg_valid_loss)
+        monitor.update("f1", avg_valid_f1)
+
+        # ---------- Save best model ----------
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch + 1,
+        }
+
+        if avg_valid_f1 > best_f1:
+            best_f1 = avg_valid_f1
+            best_path = os.path.join(
+                BESTMODEL_DIR,
+                f"inception_v3_bestmodel_epoch{epoch+1}.pth",
+            )
+            torch.save(checkpoint, best_path)
+            print(f"  -> New best model saved to: {best_path}")
+
+        # ---------- Save one model every 20 epochs ----------
+        if (epoch + 1) % 20 == 0:
+            epoch_path = os.path.join(
+                BESTMODEL_DIR,
+                f"inception_v3_epoch{epoch+1}.pth",
+            )
+            torch.save(checkpoint, epoch_path)
+            print(f"  -> Checkpoint saved to: {epoch_path}")
+
+
+if __name__ == "__main__":
+    train(num_epochs=40, threshold=0.4)
